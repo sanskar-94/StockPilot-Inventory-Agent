@@ -1,0 +1,39 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Secrets — never commit
+.env
+*/.env
+dashboard/.env
+
+# Generated artifacts
+charts_out/
+
+# Node / dashboard
+dashboard/node_modules/
+dashboard/dist/
+
+# OS
+.DS_Store
+
+# Internal briefs (kept local, not published)
+Project.md
+Website.md
+dashboard/tsconfig.tsbuildinfo
+
+# Marketing / helper — kept local, not in repo
+LINKEDIN_POST.md
+scripts/publish_github.sh
+
+# Dashboard kept local only, not published
+dashboard/
+
+# Claude harness metadata
+.claude/
+
+# Removed from public repo (kept local)
+IMPLEMENTATION_GUIDE.md
+PROJECT_OVERVIEW.md

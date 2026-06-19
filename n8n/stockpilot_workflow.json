@@ -1,0 +1,519 @@
+{
+  "name": "StockPilot",
+  "nodes": [
+    {
+      "id": "schedule",
+      "name": "Daily Schedule 6am",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -100,
+        0
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 24,
+              "triggerAtHour": 6
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "pullOrders",
+      "name": "Shopify \u00b7 Pull Orders",
+      "type": "n8n-nodes-base.shopify",
+      "typeVersion": 1,
+      "position": [
+        140,
+        -80
+      ],
+      "parameters": {
+        "authentication": "accessToken",
+        "resource": "order",
+        "operation": "getAll",
+        "returnAll": true,
+        "options": {
+          "status": "any"
+        }
+      },
+      "credentials": {
+        "shopifyAccessTokenApi": {
+          "id": "REPLACE_ME",
+          "name": "Shopify Access Token account"
+        }
+      }
+    },
+    {
+      "id": "pullProducts",
+      "name": "Shopify \u00b7 Pull Products",
+      "type": "n8n-nodes-base.shopify",
+      "typeVersion": 1,
+      "position": [
+        380,
+        -80
+      ],
+      "parameters": {
+        "authentication": "accessToken",
+        "resource": "product",
+        "operation": "getAll",
+        "returnAll": true,
+        "options": {}
+      },
+      "credentials": {
+        "shopifyAccessTokenApi": {
+          "id": "REPLACE_ME",
+          "name": "Shopify Access Token account"
+        }
+      }
+    },
+    {
+      "id": "buildPayload",
+      "name": "Build Engine Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        620,
+        -80
+      ],
+      "parameters": {
+        "jsCode": "// Flatten the Shopify pull into the engine's expected shape.\n// The native Shopify node returns one item per order / product, so read all of\n// them with .all() rather than a single { orders: [...] } envelope.\nconst shopifyOrders   = $('Shopify \u00b7 Pull Orders').all().map(i => i.json);\nconst shopifyProducts = $('Shopify \u00b7 Pull Products').all().map(i => i.json);\n\nconst orders = [];\nfor (const o of shopifyOrders) {\n  const date = (o.created_at || '').slice(0, 10);\n  for (const li of (o.line_items || [])) {\n    if (!li.sku) continue;\n    orders.push({\n      date,\n      sku: li.sku,\n      units: li.quantity,\n      price: parseFloat(li.price || 0),\n      on_promo: (li.discount_allocations && li.discount_allocations.length) ? 1 : 0,\n    });\n  }\n}\n\n// Shopify products.json does not carry unit cost (it lives on inventory_item)\n// or lead time. Use safe defaults; override per-SKU via metafields/config later.\nconst products = [];\nfor (const p of shopifyProducts) {\n  for (const v of (p.variants || [])) {\n    if (!v.sku) continue;\n    products.push({\n      sku: v.sku,\n      cost: parseFloat(v.cost || (v.price ? v.price * 0.4 : 0)),\n      price: parseFloat(v.price || 0),\n      lead_time_days: 7,\n      lead_time_std: 2,\n      supplier: p.vendor || 'default',\n      on_hand: (v.inventory_quantity != null) ? v.inventory_quantity : 0,\n      on_order: 0,\n      moq: 1,\n      order_cost: 50,\n      holding_rate: 0.25,\n    });\n  }\n}\n\nreturn [{ json: { orders, products, use_llm: true, render_charts: true } }];"
+      }
+    },
+    {
+      "id": "engineRun",
+      "name": "Engine \u00b7 POST /run",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        860,
+        -80
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://YOUR-ENGINE-PUBLIC-URL/run",
+        "options": {},
+        "authentication": "none",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json }}"
+      }
+    },
+    {
+      "id": "buildSlack",
+      "name": "Build Slack Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        -80
+      ],
+      "parameters": {
+        "jsCode": "// Turn the engine response into a Slack Block Kit message with buttons.\nconst r = $json;\nconst summary = (r.reasoning && r.reasoning.summary) || 'Reorder plan ready.';\nconst ranked  = (r.reasoning && r.reasoning.ranked_orders) || [];\nconst top = ranked.slice(0, 5)\n  .map(o => `\u2022 *${o.sku}* \u2014 order *${o.order_qty}*  _(${o.why})_`)\n  .join('\\n') || 'No SKUs need reordering right now.';\n\nconst blocks = [\n  { type: 'header', text: { type: 'plain_text', text: '\ud83d\udce6 StockPilot \u2014 reorder plan' } },\n  { type: 'section', text: { type: 'mrkdwn', text: summary } },\n  { type: 'section', text: { type: 'mrkdwn', text: top } },\n  { type: 'context', elements: [ { type: 'mrkdwn',\n      text: `Reorder *${r.reorder_count}* SKU(s) \u00b7 est. *$${r.total_order_value}*` } ] },\n  { type: 'actions', block_id: 'stockpilot_actions', elements: [\n      { type: 'button', style: 'primary', action_id: 'approve',\n        text: { type: 'plain_text', text: '\u2705 Approve' }, value: 'approve' },\n      { type: 'button', style: 'danger', action_id: 'reject',\n        text: { type: 'plain_text', text: '\u274c Reject' }, value: 'reject' },\n  ]},\n];\n\nreturn [{ json: { channel: '#inventory', text: summary, blocks } }];"
+      }
+    },
+    {
+      "id": "slackPost",
+      "name": "Slack \u00b7 Post Plan",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1340,
+        -80
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://slack.com/api/chat.postMessage",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "slackApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json; charset=utf-8"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "REPLACE_ME",
+          "name": "Slack API"
+        }
+      }
+    },
+    {
+      "id": "webhook",
+      "name": "Slack Interactivity Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -100,
+        320
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "stockpilot-approval",
+        "responseMode": "onReceived",
+        "options": {}
+      }
+    },
+    {
+      "id": "parseAction",
+      "name": "Parse Slack Action",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        140,
+        320
+      ],
+      "parameters": {
+        "jsCode": "// Slack posts interactive payloads as x-www-form-urlencoded with one 'payload'\n// field holding JSON. n8n exposes form fields under $json.body.\n// Guard every access so a stray / malformed POST never errors the execution.\nconst body = $json.body || $json;\nlet raw = body.payload || $json.payload;\nlet payload = {};\ntry { payload = (typeof raw === 'string') ? JSON.parse(raw) : (raw || {}); } catch (e) { payload = {}; }\nconst action = (payload.actions && payload.actions[0]) || {};\nreturn [{ json: {\n  decision: action.value || action.action_id || 'ignore',\n  user: (payload.user && (payload.user.username || payload.user.name)) || 'someone',\n  response_url: payload.response_url || '',\n  channel: (payload.channel && payload.channel.id) || '',\n} }];"
+      }
+    },
+    {
+      "id": "ifApproved",
+      "name": "Approved?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        380,
+        320
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "leftValue": "={{ $json.decision }}",
+              "rightValue": "approve",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "getPlan",
+      "name": "Engine \u00b7 GET /plan",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        620,
+        200
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://YOUR-ENGINE-PUBLIC-URL/plan",
+        "options": {},
+        "authentication": "none"
+      }
+    },
+    {
+      "id": "buildDraft",
+      "name": "Build Shopify Draft Order",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        860,
+        200
+      ],
+      "parameters": {
+        "jsCode": "// Build a Shopify draft order from the engine's latest cached plan.\nconst plan = $json.plan || [];\nconst lines = plan.filter(p => p.order_qty > 0).map(p => ({\n  title: p.sku,\n  quantity: p.order_qty,\n  price: p.unit_cost,            // cost basis; this is a purchase draft\n}));\nconst draft_order = {\n  draft_order: {\n    line_items: lines.length ? lines : [{ title: 'No reorder needed', quantity: 1, price: 0 }],\n    note: 'StockPilot auto-draft \u2014 approved in Slack',\n    tags: 'stockpilot',\n  },\n};\nreturn [{ json: draft_order }];"
+      }
+    },
+    {
+      "id": "createDraft",
+      "name": "Shopify \u00b7 Create Draft Order",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1100,
+        200
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://YOUR-STORE.myshopify.com/admin/api/2024-10/draft_orders.json",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "shopifyAccessTokenApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json }}",
+        "options": {}
+      },
+      "credentials": {
+        "shopifyAccessTokenApi": {
+          "id": "REPLACE_ME",
+          "name": "Shopify Access Token account"
+        }
+      }
+    },
+    {
+      "id": "confirmApproved",
+      "name": "Slack \u00b7 Confirm Approved",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1340,
+        200
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://slack.com/api/chat.postMessage",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "slackApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { channel: $('Parse Slack Action').first().json.channel, text: '\u2705 Approved by ' + $('Parse Slack Action').first().json.user + ' \u2014 draft order created in Shopify.' } }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json; charset=utf-8"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "REPLACE_ME",
+          "name": "Slack API"
+        }
+      }
+    },
+    {
+      "id": "confirmRejected",
+      "name": "Slack \u00b7 Confirm Rejected",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        620,
+        440
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://slack.com/api/chat.postMessage",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "slackApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { channel: $('Parse Slack Action').first().json.channel, text: '\u274c Rejected by ' + $('Parse Slack Action').first().json.user + ' \u2014 no order placed.' } }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json; charset=utf-8"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": {
+        "slackApi": {
+          "id": "REPLACE_ME",
+          "name": "Slack API"
+        }
+      }
+    },
+    {
+      "id": "note1",
+      "name": "Note Setup",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -120,
+        -360
+      ],
+      "parameters": {
+        "width": 780,
+        "height": 280,
+        "color": 4,
+        "content": "## StockPilot \u2014 setup before first run\n1. **Shopify credential** (the native *Shopify Access Token API* credential, already named `Shopify Access Token account`): Shop Subdomain `YOUR-STORE.myshopify.com`, plus the app **Access Token** and **API secret key**. The two pull nodes and the draft-order writeback all reuse it.\n   \u2022 App scopes needed: `read_products, read_orders, read_all_orders, read_inventory, write_draft_orders`\n2. **Slack credential** (Credentials \u2192 New \u2192 *Slack API*, name it `Slack API`): Access Token = your bot token `xoxb-...` (OAuth & Permissions \u2192 Install App). Needs scope `chat:write`; invite the bot to the channel.\n3. **Engine (n8n Cloud)**: Cloud can't reach localhost. Expose the engine with `cloudflared tunnel --url http://localhost:8000` (or deploy it) and paste the public `https://...` URL into the two *Engine \u00b7* nodes (replace `YOUR-ENGINE-PUBLIC-URL`).\n4. **Slack channel**: edit it in *Build Slack Message*."
+      }
+    },
+    {
+      "id": "note2",
+      "name": "Note Approval",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -120,
+        200
+      ],
+      "parameters": {
+        "width": 700,
+        "height": 200,
+        "color": 5,
+        "content": "## Approval path (Slack buttons \u2192 n8n)\nSlack calls this **Webhook** when a button is clicked. After saving + activating the workflow, copy the **Production URL** of *Slack Interactivity Webhook* and paste it into your Slack app \u2192 **Interactivity & Shortcuts \u2192 Request URL**.\n\nOn **Approve** the engine's cached plan is fetched and a Shopify **draft order** is created; on **Reject** nothing is ordered. Both post a confirmation back to Slack."
+      }
+    }
+  ],
+  "connections": {
+    "Daily Schedule 6am": {
+      "main": [
+        [
+          {
+            "node": "Shopify \u00b7 Pull Orders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Shopify \u00b7 Pull Orders": {
+      "main": [
+        [
+          {
+            "node": "Shopify \u00b7 Pull Products",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Shopify \u00b7 Pull Products": {
+      "main": [
+        [
+          {
+            "node": "Build Engine Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Engine Payload": {
+      "main": [
+        [
+          {
+            "node": "Engine \u00b7 POST /run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Engine \u00b7 POST /run": {
+      "main": [
+        [
+          {
+            "node": "Build Slack Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Slack Message": {
+      "main": [
+        [
+          {
+            "node": "Slack \u00b7 Post Plan",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slack Interactivity Webhook": {
+      "main": [
+        [
+          {
+            "node": "Parse Slack Action",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Slack Action": {
+      "main": [
+        [
+          {
+            "node": "Approved?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Approved?": {
+      "main": [
+        [
+          {
+            "node": "Engine \u00b7 GET /plan",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Slack \u00b7 Confirm Rejected",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Engine \u00b7 GET /plan": {
+      "main": [
+        [
+          {
+            "node": "Build Shopify Draft Order",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Shopify Draft Order": {
+      "main": [
+        [
+          {
+            "node": "Shopify \u00b7 Create Draft Order",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Shopify \u00b7 Create Draft Order": {
+      "main": [
+        [
+          {
+            "node": "Slack \u00b7 Confirm Approved",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "meta": {
+    "instanceId": "stockpilot-template"
+  },
+  "tags": []
+}

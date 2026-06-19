@@ -1,0 +1,24 @@
+# StockPilot dependencies
+# Core data + math
+pandas>=2.1
+numpy>=1.26
+scipy>=1.11
+
+# Forecasting
+scikit-learn>=1.4
+statsmodels>=0.14
+
+# Charts
+matplotlib>=3.8
+
+# API service
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.6
+
+# HTTP / LLM
+requests>=2.31
+python-dotenv>=1.0
+
+# MCP server (optional, only needed for mcp/server.py)
+mcp>=1.0.0
